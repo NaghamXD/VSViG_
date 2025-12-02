@@ -5,6 +5,12 @@ import torch, json
 import torch.nn as nn
 import numpy as np
 
+PATH_TO_DATA = 
+PATH_TO_KPTS =
+PATH_TO_LABEL = "/Users/naghamdaood/Projects/VSViG/WU-SAHZU-EMU-Video/dataset/Label.xlsx"
+PATH_TO_MODEL = 
+PATH_TO_DYNAMIC_PARTITIONS =
+
 class vsvig_dataset(Dataset):
     def __init__(self, data_folder=None, label_file=None, transform=None):
         super().__init__()
@@ -15,14 +21,17 @@ class vsvig_dataset(Dataset):
             
 
     def __getitem__(self,idx):
-        target = float(self._labels[idx][1])
-        data_idx = self._labels[idx][0]
+        
+        #target = float(self._labels[idx][1])
+        #data_idx = self._labels[idx][0]
         data = torch.load(PATH_TO_DATA) # Inputs: Batches, Frames, Points, Channles, Height, Width (B,30,15,3,32,32)
         kpts = torch.load(PATH_TO_KPTS) # (B, 15, 2), where 15 is number of kpts, and 2 means coordinates (x, y) of each kpt
-        data = data.squeeze(0)
+        #data = data.squeeze(0)
+        '''
         raw_order = list(np.arange(18)) # raw 18 keypoint COCO template
         new_order = [0,-3,-4] + list(np.arange(12)+2) + [1,-1,-2] # reorder them
         kpts[:,raw_order,:] = kpts[:,new_order,:]
+        '''
         if self._transform: # 30,15,3,32,32
             data = data.view(30*15*3,32,32)
             data = self._transform(data)
@@ -42,10 +51,15 @@ def train():
     data_path = PATH_TO_DATA # Inputs: Batches, Frames, Points, Channles, Height, Width (B,30,15,3,32,32)
     label_path = PATH_TO_LABEL # Outputs/Labels: Batches, 1 (0 to 1 probabilities/likelihoods) (B,1) 
     models = ['base', 'light']
-    
+    train_label_path = 'processed_data/train_labels.json'
+    val_label_path = 'processed_data/val_labels.json'
+
+
     for m in models:
-        dataset_train = vsvig_dataset(data_folder=data_path, label_file=label_path, transform=None)
-        dataset_val = vsvig_dataset(data_folder=data_path, label_file=label_path, transform=None)
+        dataset_train = vsvig_dataset(data_folder=data_path, label_file=train_label_path, transform=None)
+        dataset_val = vsvig_dataset(data_folder=data_path, label_file=val_label_path, transform=None)
+        #dataset_train = vsvig_dataset(data_folder=data_path, label_file=label_path, transform=None)
+        #dataset_val = vsvig_dataset(data_folder=data_path, label_file=label_path, transform=None)
         train_loader = DataLoader(dataset_train, batch_size=32, shuffle=True,num_workers=4)
         val_loader = DataLoader(dataset_val, batch_size=32, shuffle=True,num_workers=4)
         

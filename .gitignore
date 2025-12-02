@@ -1,0 +1,16 @@
+# Ignore large data files
+*.mp4
+*.pt
+*.pth
+*.npy
+
+# Ignore dataset folders
+dataset/
+processed_data/
+WU-SAHZU-EMU-Video/
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
