@@ -3,7 +3,9 @@ import torch.nn as nn
 from torchvision import transforms
 from timm.models import register_model
 import numpy as np
-    
+
+PATH_TO_DYNAMIC_PARTITIONS = 'dy_point_order.pt'
+
 class InterPartMR(nn.Module):
     def __init__(self, out_channels):
         super().__init__()
@@ -298,7 +300,7 @@ def VSViG_base(pretrained=False, **kwargs):
             self.dynamic = 1
             self.num_layer = [2,2,6,2]
             self.output_channels = [24,48,96,192]
-            self.dynamic_point_order = torch.load('PATH_TO_DYNAMIC_PARTITIONS')
+            self.dynamic_point_order = torch.load(PATH_TO_DYNAMIC_PARTITIONS)
             self.expansion = 2
             self.pos_emb = 'stem'
     opt = OptInit(**kwargs)
@@ -312,7 +314,7 @@ def VSViG_light(pretrained=False, **kwargs):
             self.dynamic = 1
             self.num_layer = [2,2,6,2]
             self.output_channels = [12,24,48,96]
-            self.dynamic_point_order = torch.load('PATH_TO_DYNAMIC_PARTITIONS')
+            self.dynamic_point_order = torch.load(PATH_TO_DYNAMIC_PARTITIONS)
             self.expansion = 2
             self.pos_emb = 'stem'
     opt = OptInit(**kwargs)

@@ -1,126 +1,239 @@
 from VSViG import *
 from torch.utils.data.dataset import Dataset
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 import torch, json
 import torch.nn as nn
 import numpy as np
+import os
+import random
+from collections import defaultdict
 
-PATH_TO_DATA = 
-PATH_TO_KPTS =
-PATH_TO_LABEL = "/Users/naghamdaood/Projects/VSViG/WU-SAHZU-EMU-Video/dataset/Label.xlsx"
-PATH_TO_MODEL = 
-PATH_TO_DYNAMIC_PARTITIONS =
+# --- CONFIGURATION ---
+PROCESSED_FOLDER = "processed_data" 
+PATH_TO_DATA_FOLDER = PROCESSED_FOLDER 
+if not os.path.exists('checkpoints'): os.makedirs('checkpoints')
+PATH_TO_SAVE_MODEL = "checkpoints/best_model.pth"
 
+# --- SMART SAMPLER (FIXES LOADING SPEED) ---
+class ChunkBatchSampler(Sampler):
+    """
+    Shuffles data, but keeps indices from the same chunk together 
+    to prevent constant hard drive reloading.
+    """
+    def __init__(self, dataset, batch_size):
+        self.batch_size = batch_size
+        self.chunk_indices = dataset.get_chunk_indices()
+        self.chunks = list(self.chunk_indices.keys())
+        
+    def __iter__(self):
+        # 1. Shuffle the order of chunks (e.g., read chunk_5, then chunk_2...)
+        random.shuffle(self.chunks)
+        
+        final_indices = []
+        
+        for chunk_name in self.chunks:
+            # 2. Get all indices in this chunk
+            indices = self.chunk_indices[chunk_name]
+            
+            # 3. Shuffle indices WITHIN the chunk
+            random.shuffle(indices)
+            
+            # 4. Add to list
+            final_indices.extend(indices)
+            
+        # 5. Yield batches
+        for i in range(0, len(final_indices), self.batch_size):
+            yield final_indices[i : i + self.batch_size]
+
+    def __len__(self):
+        return (sum(len(v) for v in self.chunk_indices.values()) + self.batch_size - 1) // self.batch_size
+
+# --- DATASET CLASS ---
 class vsvig_dataset(Dataset):
     def __init__(self, data_folder=None, label_file=None, transform=None):
         super().__init__()
         self._folder = data_folder
         self._transform = transform
+        
         with open(label_file, 'rb') as f:
             self._labels = json.load(f)
             
+        map_path = os.path.join(data_folder, 'chunk_map.json')
+        if not os.path.exists(map_path):
+            raise FileNotFoundError(f"Chunk map not found at {map_path}")
+            
+        with open(map_path, 'r') as f:
+            self._chunk_map = json.load(f) # {'global_id': [filename, local_idx]}
+            
+        self.last_chunk_name = None
+        self.last_chunk_data = None
+        self.last_chunk_kpts = None
 
-    def __getitem__(self,idx):
+    def get_chunk_indices(self):
+        """Helper for the Sampler to know which ID belongs to which chunk"""
+        groups = defaultdict(list)
+        for idx, item in enumerate(self._labels):
+            global_id = str(item[0])
+            if global_id in self._chunk_map:
+                chunk_name = self._chunk_map[global_id][0]
+                groups[chunk_name].append(idx)
+        return groups
+
+    def __getitem__(self, idx):
+        target = float(self._labels[idx][1])
+        global_id = str(self._labels[idx][0]) 
         
-        #target = float(self._labels[idx][1])
-        #data_idx = self._labels[idx][0]
-        data = torch.load(PATH_TO_DATA) # Inputs: Batches, Frames, Points, Channles, Height, Width (B,30,15,3,32,32)
-        kpts = torch.load(PATH_TO_KPTS) # (B, 15, 2), where 15 is number of kpts, and 2 means coordinates (x, y) of each kpt
-        #data = data.squeeze(0)
-        '''
-        raw_order = list(np.arange(18)) # raw 18 keypoint COCO template
-        new_order = [0,-3,-4] + list(np.arange(12)+2) + [1,-1,-2] # reorder them
-        kpts[:,raw_order,:] = kpts[:,new_order,:]
-        '''
-        if self._transform: # 30,15,3,32,32
-            data = data.view(30*15*3,32,32)
+        if global_id not in self._chunk_map:
+             # Just return a zero-tensor if missing (safer than crashing mid-training)
+             # But strictly you should ensure map is complete.
+             raise IndexError(f"ID {global_id} missing from map.")
+
+        filename, local_idx = self._chunk_map[global_id]
+        
+        # Lazy Loading
+        if filename != self.last_chunk_name:
+            self.last_chunk_name = filename
+            data_path = os.path.join(self._folder, filename)
+            kpts_path = os.path.join(self._folder, filename.replace('chunk_data', 'chunk_kpts'))
+            self.last_chunk_data = torch.load(data_path, map_location='cpu')
+            self.last_chunk_kpts = torch.load(kpts_path, map_location='cpu')
+            
+        data = self.last_chunk_data[local_idx] # (30, 15, 3, 32, 32)
+        kpts = self.last_chunk_kpts[local_idx] # (30, 15, 2)
+        
+        # --- FIX 1: NORMALIZE KEYPOINTS ---
+        kpts = kpts.float()
+        kpts[:, :, 0] = kpts[:, :, 0] / 1920.0
+        kpts[:, :, 1] = kpts[:, :, 1] / 1080.0
+
+        # --- FIX 2: ADD CONFIDENCE CHANNEL (2 -> 3 CHANNELS) ---
+        # Current shape: (30, 15, 2)
+        # We need: (30, 15, 3)
+        confidence = torch.ones((30, 15, 1), dtype=kpts.dtype)
+        kpts = torch.cat((kpts, confidence), dim=2) 
+        
+        if self._transform: 
+            B_frames, P, C, H, W = data.shape 
+            data = data.view(B_frames*P*C, H, W)
             data = self._transform(data)
-            data = data.view(30,15,3,32,32)
+            data = data.view(B_frames, P, C, H, W)
             
         sample = {
             'data': data,
-            'kpts': kpts[:,:15,:]
-            }
+            'kpts': kpts 
+        }
         return sample, target
     
     def __len__(self):
         return len(self._labels)
 
 def train():
-    dy_point_order = torch.load('PATH_TO_DYNAMIC_PARTITIONS')
-    data_path = PATH_TO_DATA # Inputs: Batches, Frames, Points, Channles, Height, Width (B,30,15,3,32,32)
-    label_path = PATH_TO_LABEL # Outputs/Labels: Batches, 1 (0 to 1 probabilities/likelihoods) (B,1) 
-    models = ['base', 'light']
-    train_label_path = 'processed_data/train_labels.json'
-    val_label_path = 'processed_data/val_labels.json'
-
-
-    for m in models:
-        dataset_train = vsvig_dataset(data_folder=data_path, label_file=train_label_path, transform=None)
-        dataset_val = vsvig_dataset(data_folder=data_path, label_file=val_label_path, transform=None)
-        #dataset_train = vsvig_dataset(data_folder=data_path, label_file=label_path, transform=None)
-        #dataset_val = vsvig_dataset(data_folder=data_path, label_file=label_path, transform=None)
-        train_loader = DataLoader(dataset_train, batch_size=32, shuffle=True,num_workers=4)
-        val_loader = DataLoader(dataset_val, batch_size=32, shuffle=True,num_workers=4)
+    train_label_path = os.path.join(PROCESSED_FOLDER, 'train_labels.json')
+    val_label_path = os.path.join(PROCESSED_FOLDER, 'val_labels.json')
+    
+    models_to_train = ['Base'] 
+    
+    for m in models_to_train:
+        print(f"Initializing {m} Model Training...")
         
-        # criterion = nn.BCEWithLogitsLoss()
+        dataset_train = vsvig_dataset(data_folder=PATH_TO_DATA_FOLDER, label_file=train_label_path)
+        dataset_val = vsvig_dataset(data_folder=PATH_TO_DATA_FOLDER, label_file=val_label_path)
+        
+        # --- USE CUSTOM SAMPLER FOR TRAIN ---
+        # Note: 'shuffle' must be False when using batch_sampler
+        train_sampler = ChunkBatchSampler(dataset_train, batch_size=32)
+        train_loader = DataLoader(dataset_train, batch_sampler=train_sampler, num_workers=0)
+        
+        # Val loader can be standard (no shuffling needed usually)
+        val_loader = DataLoader(dataset_val, batch_size=32, shuffle=False, num_workers=0)
+        
         MSE = nn.MSELoss()
         epochs = 200
         min_valid_loss = np.inf
+        
         if m == 'Base':
-            model = VSViG_base()
+            model = VSViG_base() 
         elif m == 'Light':
             model = VSViG_light()
-        if torch.cuda.is_available():
-            model = model.cuda()
+            
+        if os.path.exists('VSViG-base.pth'):
+            print("Loading pretrained weights...")
+            model.load_state_dict(torch.load('VSViG-base.pth', map_location='cpu'))
+            
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+            print("Using MPS (Apple Silicon) acceleration")
+        elif torch.cuda.is_available():
+            device = torch.device("cuda")
+            print("Using CUDA acceleration")
+        else:
+            device = torch.device("cpu")
+            print("Using CPU")
+            
+        model = model.to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr = 1e-4, weight_decay=1e-5)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.1)
-        train_loss_stack = []
+        
         for e in range(epochs):
             train_loss = 0.0
-            
             model.train()
             optimizer.zero_grad()
-            print(f'===================================\n Running Epoch: {e+1} \n===================================')
+            print(f'\n=== Epoch: {e+1} ===')
 
-            for sample, labels in train_loader:
-                data = sample['data']
-                kpts = sample['kpts']
+            for batch_idx, (sample, labels) in enumerate(train_loader):
+                data = sample['data'].to(device)
+                kpts = sample['kpts'].to(device)
+                labels = labels.float().to(device)
 
-                if torch.cuda.is_available():
-                    data, labels, kpts = data.cuda(), labels.cuda(), kpts.cuda()
-                outputs = model(data,kpts)
-                # print(outputs)
-                loss = MSE(outputs.float(),labels.float())
+                outputs = model(data, kpts)
+                
+                # --- FIX 3: SAFE SQUEEZE ---
+                # squeeze() without args is dangerous if batch_size=1
+                # This ensures we only squeeze the last dim if it is 1
+                if outputs.dim() > 1 and outputs.shape[1] == 1:
+                    outputs = outputs.squeeze(1)
+                
+                loss = MSE(outputs.float(), labels.float())
                 loss.backward()
                 optimizer.step()
+                optimizer.zero_grad()
+                
                 train_loss += loss.item()
-                train_loss_stack.append(loss.item())
-            print(f'Training Loss: {train_loss:.3f}')
+                
+                if batch_idx % 10 == 0:
+                    print(f"\rBatch {batch_idx}/{len(train_loader)} Loss: {loss.item():.4f}", end="")
+            
+            print(f'\nTraining Loss: {train_loss / len(train_loader):.4f}')
 
-            if (e+1)%5 == 0:
+            if (e+1) % 5 == 0:
                 valid_loss = 0.0
                 RMSE_loss = 0.0
-                _iter = 0
                 model.eval()
-
-                for sample, labels in val_loader:
-                    data = sample['data']
-                    kpts = sample['kpts']
-                    if torch.cuda.is_available():
-                        data, labels, kpts = data.cuda(), labels.cuda(), kpts.cuda()
-                    outputs = model(data,kpts)
-                    loss = MSE(outputs,labels)
-                    valid_loss += loss.item()
-                    RMSE_loss += torch.sqrt(MSE(outputs,labels)).item()*100
-                    _iter += 1
-                print(f' +++++++++++++++++++++++++++++++++++\n Val Loss: {valid_loss:.3f} \t Val RMSE: {RMSE_loss/_iter:.3f} \n +++++++++++++++++++++++++++++++++++')
+                
+                with torch.no_grad():
+                    for sample, labels in val_loader:
+                        data = sample['data'].to(device)
+                        kpts = sample['kpts'].to(device)
+                        labels = labels.float().to(device)
+                        
+                        outputs = model(data, kpts)
+                        if outputs.dim() > 1 and outputs.shape[1] == 1:
+                            outputs = outputs.squeeze(1)
+                        
+                        loss = MSE(outputs, labels)
+                        valid_loss += loss.item()
+                        RMSE_loss += torch.sqrt(MSE(outputs, labels)).item() * 100
+                
+                avg_val_loss = valid_loss / len(val_loader)
+                avg_rmse = RMSE_loss / len(val_loader)
+                
+                print(f' +++ Val Loss: {avg_val_loss:.3f} | Val RMSE: {avg_rmse:.3f} +++')
 
                 if min_valid_loss > valid_loss:
-                    print(f'save the model \n +++++++++++++++++++++++++++++++++++')
+                    print(f'   -> Saving new best model to {PATH_TO_SAVE_MODEL}')
                     min_valid_loss = valid_loss
-                    save_model_path = PATH_TO_MODEL
-                    torch.save(model.state_dict(), save_model_path)
+                    torch.save(model.state_dict(), PATH_TO_SAVE_MODEL)
+            
             scheduler.step()
                     
 if __name__ == '__main__':
