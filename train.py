@@ -11,8 +11,14 @@ from collections import defaultdict
 # --- CONFIGURATION ---
 PROCESSED_FOLDER = "processed_data" 
 PATH_TO_DATA_FOLDER = PROCESSED_FOLDER 
-if not os.path.exists('checkpoints'): os.makedirs('checkpoints')
-PATH_TO_SAVE_MODEL = "checkpoints/best_model.pth"
+
+# --- PATH CONFIGS ---
+CHECKPOINT_DIR = "checkpoints"
+if not os.path.exists(CHECKPOINT_DIR): os.makedirs(CHECKPOINT_DIR)
+
+PATH_TO_BEST_MODEL = os.path.join(CHECKPOINT_DIR, "best_model.pth")
+PATH_TO_LAST_CKPT  = os.path.join(CHECKPOINT_DIR, "last_checkpoint.pth")
+PATH_TO_LOG_FILE   = os.path.join(CHECKPOINT_DIR, "training_log.json")
 
 # --- SMART SAMPLER (FIXES LOADING SPEED) ---
 class ChunkBatchSampler(Sampler):
@@ -136,45 +142,69 @@ def train():
     for m in models_to_train:
         print(f"Initializing {m} Model Training...")
         
+        # 1. Setup Data
         dataset_train = vsvig_dataset(data_folder=PATH_TO_DATA_FOLDER, label_file=train_label_path)
         dataset_val = vsvig_dataset(data_folder=PATH_TO_DATA_FOLDER, label_file=val_label_path)
         
-        # --- USE CUSTOM SAMPLER FOR TRAIN ---
-        # Note: 'shuffle' must be False when using batch_sampler
         train_sampler = ChunkBatchSampler(dataset_train, batch_size=32)
         train_loader = DataLoader(dataset_train, batch_sampler=train_sampler, num_workers=0)
-        
-        # Val loader can be standard (no shuffling needed usually)
         val_loader = DataLoader(dataset_val, batch_size=32, shuffle=False, num_workers=0)
         
-        MSE = nn.MSELoss()
-        epochs = 200
-        min_valid_loss = np.inf
-        
+        # 2. Setup Model & Hardware
         if m == 'Base':
             model = VSViG_base() 
         elif m == 'Light':
             model = VSViG_light()
-            
-        if os.path.exists('VSViG-base.pth'):
-            print("Loading pretrained weights...")
-            model.load_state_dict(torch.load('VSViG-base.pth', map_location='cpu'))
-            
+
         if torch.backends.mps.is_available():
             device = torch.device("mps")
-            print("Using MPS (Apple Silicon) acceleration")
         elif torch.cuda.is_available():
             device = torch.device("cuda")
-            print("Using CUDA acceleration")
         else:
             device = torch.device("cpu")
-            print("Using CPU")
-            
-        model = model.to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr = 1e-4, weight_decay=1e-5)
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.1)
+        print(f"Device: {device}")
         
-        for e in range(epochs):
+        model = model.to(device)
+        MSE = nn.MSELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.1)
+
+        # --- RESUME LOGIC STARTS HERE ---
+        start_epoch = 0
+        min_valid_loss = np.inf
+        history = {'train_loss': [], 'val_loss': [], 'val_rmse': []}
+
+        # Check for 'last_checkpoint.pth' (Full state for resuming)
+        if os.path.exists(PATH_TO_LAST_CKPT):
+            print(f"Found checkpoint: {PATH_TO_LAST_CKPT}. Resuming...")
+            checkpoint = torch.load(PATH_TO_LAST_CKPT, map_location=device)
+            
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            min_valid_loss = checkpoint['min_valid_loss']
+            
+            # Load history if it exists
+            if 'history' in checkpoint:
+                history = checkpoint['history']
+
+        # Fallback: If only 'best_model.pth' exists (like your current situation)
+        elif os.path.exists(PATH_TO_BEST_MODEL):
+            print(f"Found best_model.pth but no checkpoint. Loading weights only.")
+            # We assume a weight-only save for the old file
+            try:
+                model.load_state_dict(torch.load(PATH_TO_BEST_MODEL, map_location=device))
+            except:
+                print("Could not load best_model.pth weights. Starting fresh.")
+            # Since we don't know the epoch, we might have to start at 0 or guess
+            # You mentioned you were at epoch 137, so let's set it manually if you like:
+            # start_epoch = 137 
+
+        epochs = 200
+        
+        # 3. Training Loop
+        for e in range(start_epoch, epochs):
             train_loss = 0.0
             model.train()
             optimizer.zero_grad()
@@ -187,9 +217,6 @@ def train():
 
                 outputs = model(data, kpts)
                 
-                # --- FIX 3: SAFE SQUEEZE ---
-                # squeeze() without args is dangerous if batch_size=1
-                # This ensures we only squeeze the last dim if it is 1
                 if outputs.dim() > 1 and outputs.shape[1] == 1:
                     outputs = outputs.squeeze(1)
                 
@@ -203,8 +230,11 @@ def train():
                 if batch_idx % 10 == 0:
                     print(f"\rBatch {batch_idx}/{len(train_loader)} Loss: {loss.item():.4f}", end="")
             
-            print(f'\nTraining Loss: {train_loss / len(train_loader):.4f}')
+            avg_train_loss = train_loss / len(train_loader)
+            history['train_loss'].append(avg_train_loss)
+            print(f'\nTraining Loss: {avg_train_loss:.4f}')
 
+            # 4. Validation & Saving
             if (e+1) % 5 == 0:
                 valid_loss = 0.0
                 RMSE_loss = 0.0
@@ -227,14 +257,33 @@ def train():
                 avg_val_loss = valid_loss / len(val_loader)
                 avg_rmse = RMSE_loss / len(val_loader)
                 
+                history['val_loss'].append(avg_val_loss)
+                history['val_rmse'].append(avg_rmse)
+                
                 print(f' +++ Val Loss: {avg_val_loss:.3f} | Val RMSE: {avg_rmse:.3f} +++')
 
+                # Save BEST model (Weights only is fine for inference)
                 if min_valid_loss > valid_loss:
-                    print(f'   -> Saving new best model to {PATH_TO_SAVE_MODEL}')
+                    print(f'   -> Saving new best model to {PATH_TO_BEST_MODEL}')
                     min_valid_loss = valid_loss
-                    torch.save(model.state_dict(), PATH_TO_SAVE_MODEL)
+                    torch.save(model.state_dict(), PATH_TO_BEST_MODEL)
             
             scheduler.step()
+
+            # 5. SAVE REGULAR CHECKPOINT (Every Epoch)
+            # This allows you to resume even if you crash between validation runs
+            torch.save({
+                'epoch': e,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'min_valid_loss': min_valid_loss,
+                'history': history
+            }, PATH_TO_LAST_CKPT)
+
+            # 6. SAVE LOGS TO FILE
+            with open(PATH_TO_LOG_FILE, 'w') as f:
+                json.dump(history, f, indent=4)
                     
 if __name__ == '__main__':
     train()
