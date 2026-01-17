@@ -115,22 +115,70 @@ def get_label(current_time, eeg_start, clinical_start, k=5):
         
         return float(label)
                 
-def extract_features(frame, net, prev_kpts=None):
-    """
-    Extracts patches and keypoints from a frame.
-    Args:
-        frame: The image frame.
-        net: The pose estimation model.
-        prev_kpts: (Optional) 18x2 numpy array of keypoints from the previous frame 
-                   to use as fallback if detection fails.
-    """
+'''
+def extract_features(frame, net):
+    # 1. OpenPose Inference
+    net_input_height_size = 256
+    stride = 8
+    upsample_ratio = 4
+    img_h, img_w, _ = frame.shape
+    scale = net_input_height_size / img_h
+    
+    # Resize image to fit model input
+    scaled_img = cv2.resize(frame, (0,0), fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    tensor_img = pose_transform(scaled_img).unsqueeze(0).to(device)
+    
+    with torch.no_grad():
+        stages_output = net(tensor_img)
+        stage2_heatmaps = stages_output[-2]
+        stage2_pafs = stages_output[-1]
+        heatmaps = stage2_heatmaps.cpu().numpy()
+        pafs = stage2_pafs.cpu().numpy() # Ensure this is numpy too
+        
+    # Order: heatmap, paf, stride, upsample_ratio
+    total_keypoints_num, all_keypoints_by_type = extract_keypoints(
+        heatmaps[0], pafs[0], upsample_ratio
+    )
+    
+    # 2. Collect 18 Raw Keypoints
+    raw_18_coords = []
+    
+    for joint_id in range(18):
+        joint_data = all_keypoints_by_type[joint_id]
+        if len(joint_data) > 0:
+            # joint_data format: [x, y, score, id]
+            best_match = max(joint_data, key=lambda x: x[2])
+            x_orig = int(best_match[0] / scale)
+            y_orig = int(best_match[1] / scale)
+        else:
+            x_orig, y_orig = img_w // 2, img_h // 2
+        raw_18_coords.append([x_orig, y_orig])
+        
+    kpts_np = np.array(raw_18_coords) # Shape (18, 2)
+    
+    # 3. Call Authors' Patch Extraction
+    # Note: We pass raw 18 keypoints; their script filters them to 15.
+    patches_np = extract_patches(frame, kpts_np, kernel_size=128, scale=0.25)
+    
+    # 4. Handle Keypoints Filtering Manually
+    # We must delete the same joints the authors did (Neck, Eyes) to match the patches
+    # Indices: 1 (Neck), 14 (REye), 15 (LEye)
+    filtered_kpts_np = np.delete(kpts_np, [1, 14, 15], axis=0)
+
+    # 5. Convert to PyTorch Tensors
+    # Patches: (15, 32, 32, 3) -> (15, 3, 32, 32)
+    patches_t = torch.from_numpy(patches_np).permute(0, 3, 1, 2).float() / 255.0
+    kpts_t = torch.from_numpy(filtered_kpts_np)
+    
+    return patches_t, kpts_t
+'''
+def extract_features(frame, net):
     # 1. OpenPose Inference
     net_input_height_size = 256
     upsample_ratio = 4
     img_h, img_w, _ = frame.shape
     scale = net_input_height_size / img_h
     
-    # Resize
     scaled_img = cv2.resize(frame, (0,0), fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
     tensor_img = pose_transform(scaled_img).unsqueeze(0).to(device)
     
@@ -144,6 +192,8 @@ def extract_features(frame, net, prev_kpts=None):
     # Transpose to (H, W, 19) so we can slice channels easily
     # Note: If heatmaps are already (Batch, C, H, W), heatmaps[0] is (C, H, W).
     # We need (H, W, C) or just (C, H, W) is fine if we index [i, :, :]
+    # Let's verify shape. Usually it is (1, 19, 32, 56) or similar.
+    # heatmaps[0] -> (19, 32, 56)
     
     full_heatmap = heatmaps[0] 
     
@@ -164,22 +214,23 @@ def extract_features(frame, net, prev_kpts=None):
         total_kpt_num = 0 # Dummy counter
         
         # Call the function (It modifies found_keypoints_list in-place)
+        # It expects a 2D heatmap. single_heatmap is (H, W).
         extract_keypoints(single_heatmap, found_keypoints_list, total_kpt_num)
         
-        # --- FALLBACK LOGIC ---
-        # 1. Default to Center
-        x_orig, y_orig = img_w // 2, img_h // 2
+        # found_keypoints_list now contains a LIST of tuples for this joint
+        # The function does: all_keypoints.append(keypoints_with_score_and_id)
+        # So found_keypoints_list[0] is the list of candidates [(x, y, score, id), ...]
         
-        # 2. If we have history, prefer "Last Known Position" over Center
-        if prev_kpts is not None:
-            # joint_id matches the index in prev_kpts
-            x_orig, y_orig = prev_kpts[joint_id]
-            
-        # 3. If OpenPose found a new valid point, update it
+        x_orig, y_orig = img_w // 2, img_h // 2 # Default center
+        
         if len(found_keypoints_list) > 0:
             candidates = found_keypoints_list[0]
             if len(candidates) > 0:
                 # Get best match (highest score is index 2)
+                # candidate format: (x, y, score, global_id)
+                # We sort by score to be safe, though extract_keypoints sorts by X usually?
+                # Actually extract_keypoints sorts by X coordinate (itemgetter(0)).
+                # We want highest confidence (index 2).
                 best_match = max(candidates, key=lambda x: x[2])
                 
                 x_heatmap, y_heatmap = best_match[0], best_match[1]
@@ -193,40 +244,18 @@ def extract_features(frame, net, prev_kpts=None):
         
     kpts_np = np.array(raw_18_coords)
     
-    # 1. Filter & Reorder to VSViG Format (15 points, grouped)
-    # Head(0,14,15), RArm(2,3,4), RLeg(8,9,10), LArm(5,6,7), LLeg(11,12,13)
-    vsvig_indices = [0, 14, 15, 2, 3, 4, 8, 9, 10, 5, 6, 7, 11, 12, 13]
+    # 3. Extract Patches (Authors' Code)
+    patches_np = extract_patches(frame, kpts_np, kernel_size=128, scale=0.25)
     
-    sorted_kpts_np = kpts_np[vsvig_indices]
-    
-    # 2. Extract Patches using the SORTED 15 points
-    # (Assuming you modified extract_patches.py to NOT delete anything)
-    patches_np = extract_patches(frame, sorted_kpts_np, kernel_size=128, scale=0.25)
-    
-    # Safety Check
-    if np.isnan(patches_np).any():
-        patches_np = np.nan_to_num(patches_np, nan=0.0)
-    
-    # 3. Convert
-    patches_t = torch.from_numpy(patches_np).permute(0, 3, 1, 2).float() / 255.0
-    
-    # 4. Filter AND Reorder Keypoints (18 -> 15 Sorted by Partition)
-    # We map from OpenPose 18-index to VSViG 15-index
-    # OpenPose: 0:Nose, 1:Neck, 2:RSho, 3:RElb, 4:RWri, 5:LSho, 6:LElb, 7:LWri, 
-    #           8:RHip, 9:RKnee, 10:RAnk, 11:LHip, 12:LKnee, 13:LAnk, 14:REye, 15:LEye, 16:REar, 17:LEar
-    
-    # VSViG Order (Grouped by 3):
-    # Head:  [Nose(0), REye(14), LEye(15)]
-    # R-Arm: [RSho(2), RElb(3), RWri(4)]
-    # R-Leg: [RHip(8), RKnee(9), RAnk(10)]
-    # L-Arm: [LSho(5), LElb(6), LWri(7)]
-    # L-Leg: [LHip(11), LKnee(12), LAnk(13)]
-    
+    # 4. Filter Keypoints (18 -> 15)
+    # Removing Neck (1), R-Eye (14), L-Eye (15) to match the 15 joints
+    filtered_kpts_np = np.delete(kpts_np, [1, 14, 15], axis=0)
+
     # 5. Convert to Tensor
-    kpts_t = torch.from_numpy(sorted_kpts_np)
+    patches_t = torch.from_numpy(patches_np).permute(0, 3, 1, 2).float() / 255.0
+    kpts_t = torch.from_numpy(filtered_kpts_np)
     
-    # Return patches, filtered kpts, AND raw kpts (for next frame state)
-    return patches_t, kpts_t, kpts_np
+    return patches_t, kpts_t
 
 def parse_filename_info(folder_name, filename):
     """
@@ -282,7 +311,7 @@ def main():
     all_labels = [] 
     clip_counter = 0
     
-    # Get patient folders
+    # Get patient folders (pat01, pat02...)
     try:
         patient_folders = sorted([f for f in os.listdir(DATASET_ROOT) if os.path.isdir(os.path.join(DATASET_ROOT, f)) and f.lower().startswith('pat')])
     except FileNotFoundError:
@@ -297,21 +326,23 @@ def main():
         video_files = [f for f in os.listdir(curr_pat_path) if f.endswith('.mp4')]
         
         for vid_file in video_files:
-            # 1. Parse Filename
+            
+            # --- 1. PARSE FILENAME INFO ---
+            # Make sure you have the updated parse_filename_info function defined above this main()
             pat_id, sz_id = parse_filename_info(pat_folder, vid_file)
             
-            # Skip if file shouldn't be processed
+            # Skip if file shouldn't be processed (e.g. "free.mp4")
             if pat_id is None:
                 continue
                 
-            # 2. Match with Excel
+            # --- 2. MATCH WITH EXCEL ---
             row = df[(df['PatID'] == pat_id) & (df['#Seizure'] == sz_id)]
             
             if row.empty:
                 print(f"   ⚠️  Warning: File '{vid_file}' found, but NO entry in Excel for {pat_id} - {sz_id}")
                 continue
             
-            # 3. Get Times
+            # --- 3. GET TIMES ---
             eeg_time = time_to_sec(row.iloc[0]['EEG onset'])
             clin_time = time_to_sec(row.iloc[0]['Clinical Onset'])
             
@@ -335,35 +366,36 @@ def main():
             
             clip_len = int(5 * fps) # 5 seconds
             
-            # Step sizes in frames
-            step_interictal = int(5 * fps) # No overlap
-            step_seizure = int(1 * fps)    # 4s overlap (5 - 1 = 4 overlap)
+            # --- DYNAMIC STEP SIZES (Paper's Balancing Strategy) ---
+            # Interictal (Healthy): 5s step (No overlap)
+            # Seizure/Transition: 1s step (4s overlap)
+            step_interictal = int(5 * fps)
+            step_seizure = int(1 * fps)
             
             current_frame = 0
             
-            # Using tqdm for progress bar
+            # Progress bar for this specific video
             pbar = tqdm(total=total_frames - clip_len, desc=f"   Processing Clips")
             
+            # --- MAIN VIDEO LOOP ---
             while current_frame < (total_frames - clip_len):
                 
                 # A. Determine Label First (to decide step size)
+                # We calculate label based on the END time of the potential clip
                 clip_end_time = (current_frame + clip_len) / fps
                 label = get_label(clip_end_time, eeg_time, clin_time)
                 
                 # B. Decide Step Size based on Label
+                # If Healthy (0.0), jump 5s. If Seizure (>0.0), jump 1s.
                 if label == 0.0:
                     current_step = step_interictal
                 else:
                     current_step = step_seizure
                 
-                # C. Extract Frames (The "Stride" Logic)
+                # C. Extract Frames (The "Stride" Logic: 150 frames -> 30 frames)
                 clip_patches = []
                 clip_kpts = []
                 valid_clip = True
-                
-                # --- STATE VARIABLE FOR SMOOTHING ---
-                # Reset state at the start of every new clip to avoid drifting from jumps
-                last_known_kpts = None
                 
                 for i in range(0, clip_len, STRIDE):
                     cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame + i)
@@ -372,19 +404,14 @@ def main():
                         valid_clip = False
                         break
                     
-                    # Pass state and receive updated state
-                    patches, kpts, raw_kpts_np = extract_features(frame, pose_net, prev_kpts=last_known_kpts)
-                    
-                    # Update state for next frame iteration
-                    last_known_kpts = raw_kpts_np
-                    
+                    patches, kpts = extract_features(frame, pose_net)
                     clip_patches.append(patches)
                     clip_kpts.append(kpts)
                 
                 # D. Verify & Store
                 if valid_clip and len(clip_patches) == CLIP_FRAMES:
-                    final_clip_tensor = torch.stack(clip_patches) # (30, 15, 3, 32, 32)
-                    final_kpts_tensor = torch.stack(clip_kpts)    # (30, 15, 2)
+                    final_clip_tensor = torch.stack(clip_patches) # Shape: (30, 15, 3, 32, 32)
+                    final_kpts_tensor = torch.stack(clip_kpts)    # Shape: (30, 15, 2)
                     
                     all_clip_data.append(final_clip_tensor)
                     all_clip_kpts.append(final_kpts_tensor)
@@ -406,6 +433,7 @@ def main():
             cap.release()
 
     # --- SAVE LEFTOVERS (Critical Fix) ---
+    # This saves the clips remaining in the buffer after all patients are processed
     if len(all_clip_data) > 0:
         print(f"💾 Saving final chunk of {len(all_clip_data)} clips...")
         torch.save(torch.stack(all_clip_data), f"{OUTPUT_FOLDER}/chunk_data_FINAL.pt")
