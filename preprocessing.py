@@ -21,14 +21,21 @@ OUTPUT_FOLDER = 'processed_data' # Where to save the .pt files
 DATASET_ROOT = 'WU-SAHZU-EMU-Video/dataset' 
 EXCEL_FILE = os.path.join(DATASET_ROOT, 'Label.xlsx')
 POSE_WEIGHTS = 'pose.pth'
+
+# Paper Params
 PATCH_SIZE = 32                  # From your train.py comments
 CLIP_FRAMES = 30                 # 5 seconds * (30fps / stride 5)
 STRIDE = 5                       # Frame sampling stride
-NUM_JOINTS = 15                  # Number of joints to keep (matching train.py)
+SIGMA_SCALE = 0.3                  # Number of joints to keep (matching train.py)
+
+# Time Limits (VSViG Paper Constraints)
+MAX_INTERICTAL_MIN = 30          # "30 min interictal periods before EEG onset" [cite: 275]
+MAX_ICTAL_MIN = 2                # "period < 2min after clinical onset" [cite: 567]
 
 # Standard COCO Keypoint mapping (Lightweight OpenPose uses 18 usually)
 # We will extract all 18 initially, then train.py filters them.
-# Keypoints: 0:Nose, 1:Neck, 2:RShou, 3:RElb, 4:RWri, 5:LShou, 6:LElb, 7:LWri, ...
+# Keypoints: 0:Nose, 1:Neck, 2:RShou, 3:RElb, 4:RWri, 5:LShou, 6:LElb, 7:LWri, 8:MidHip, 9:RHip, 10:RKnee,
+#  11:RAnk, 12:LHip, 13:LKnee, 14:LAnk, 15:REye, 16:LEye, 17:REar, 18:LEar
 
 # --- 2. LOAD POSE MODEL (Updated for OpenPose-Lightweight) ---
 # Ensure you have cloned the 'lightweight-human-pose-estimation.pytorch' repo
@@ -86,7 +93,6 @@ def time_to_sec(time_val):
         return -1
     return -1
 
-
 def get_label(current_time, eeg_start, clinical_start, k=5):
     """
     Formal Exponential labeling: (e^kx - 1) / (e^k - 1)
@@ -115,117 +121,123 @@ def get_label(current_time, eeg_start, clinical_start, k=5):
         
         return float(label)
                 
+def gen_gaussian_kernel(size, sigma):
+    """
+    Generates the Gaussian heatmap for fusion.
+    Adapted from VSViG paper Eq 1 logic.
+    """
+    # Create a grid of (x,y) coordinates
+    kernel = np.fromfunction(
+        lambda x, y: (1/(2*math.pi*sigma**2)) * math.e ** ((-1*((x-(size-1)/2)**2+(y-(size-1)/2)**2))/(2*sigma**2)), 
+        (size, size)
+    )
+    # Normalize to 0-1 range as per typical heatmap usage in fusion
+    kernel = kernel / np.max(kernel)
+    return kernel
+
+def extract_patches_integrated(img, sorted_kpts_15, kernel_size=128, scale=0.25):
+    """
+    Corrected version of extract_patches.
+    - Uses the SORTED 15 keypoints (does not delete indices internally).
+    - Implements the Fusion Strategy: Patch * Gaussian 
+    """
+    img_h, img_w, _ = img.shape
+    
+    # Pad image to handle boundary keypoints
+    pad_img = np.zeros((img_h + kernel_size*2, img_w + kernel_size*2, 3), dtype=np.uint8)
+    pad_img[kernel_size:-kernel_size, kernel_size:-kernel_size, :] = img
+    
+    # 1. Generate Gaussian Kernel (Sigma=0.3 relative to patch size)
+    # Note: VSViG paper says sigma=0.3 relative to patch size. 
+    # If Kernel is 128, sigma is 128*0.3 = 38.4. 
+    # Then we resize by 0.25 to get 32x32.
+    sigma = kernel_size * SIGMA_SCALE
+    kernel = gen_gaussian_kernel(kernel_size, sigma)
+    
+    # Expand kernel to 3 channels for element-wise multiplication with RGB
+    kernel = np.expand_dims(kernel, 2).repeat(3, axis=2)
+    
+    patches = []
+    
+    # 2. Iterate over the 15 correct VSViG joints
+    for idx in range(15):
+        kx, ky = sorted_kpts_15[idx]
+        
+        # Adjust coordinates for padding (shift by kernel_size)
+        # Center of the patch is the keypoint
+        y_start = int(ky + kernel_size - 0.5 * kernel_size)
+        y_end   = int(ky + kernel_size + 0.5 * kernel_size)
+        x_start = int(kx + kernel_size - 0.5 * kernel_size)
+        x_end   = int(kx + kernel_size + 0.5 * kernel_size)
+        
+        # Crop
+        raw_patch = pad_img[y_start:y_end, x_start:x_end, :]
+        
+        # 3. FUSION: "fuse the raw RGB frames" via multiplication [cite: 165, 168]
+        # We normalize raw patch to 0-255 float for math, then mult by 0-1 kernel
+        fused_patch = raw_patch.astype(np.float32) * kernel
+        
+        # 4. Resize to final size (128 -> 32)
+        # Using INTER_LINEAR as per your snippet
+        resized_patch = cv2.resize(fused_patch, (0,0), fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+        
+        # Normalize to 0-255 range strictly before outputting
+        # (Your snippet used a min-max norm per patch, standard is usually just ensuring range)
+        # We will keep it simple: clip and cast.
+        resized_patch = np.clip(resized_patch, 0, 255)
+        
+        patches.append(resized_patch)
+        
+    return np.array(patches) # (15, 32, 32, 3)
+
 def extract_features(frame, net, prev_kpts=None):
-    """
-    Extracts patches and keypoints from a frame.
-    Args:
-        frame: The image frame.
-        net: The pose estimation model.
-        prev_kpts: (Optional) 18x2 numpy array of keypoints from the previous frame 
-                   to use as fallback if detection fails.
-    """
     # 1. OpenPose Inference
     net_input_height_size = 256
-    upsample_ratio = 4
     img_h, img_w, _ = frame.shape
     scale = net_input_height_size / img_h
-    
-    # Resize
     scaled_img = cv2.resize(frame, (0,0), fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
     tensor_img = pose_transform(scaled_img).unsqueeze(0).to(device)
     
     with torch.no_grad():
         stages_output = net(tensor_img)
-        # Get heatmaps (Stage 2 is typically the final stage in lightweight openpose)
-        stage2_heatmaps = stages_output[-2]
-        heatmaps = stage2_heatmaps.cpu().numpy()
-        
-    # Get the first image in batch (19, H, W)
-    # Transpose to (H, W, 19) so we can slice channels easily
-    # Note: If heatmaps are already (Batch, C, H, W), heatmaps[0] is (C, H, W).
-    # We need (H, W, C) or just (C, H, W) is fine if we index [i, :, :]
+        heatmaps = stages_output[-2].cpu().numpy()[0] # (19, H, W)
     
-    full_heatmap = heatmaps[0] 
-    
-    # 2. Extract Keypoints Manually Loop
-    # We iterate over 18 joints (Channel 0 to 17)
-    # Channel 18 is usually background
-    
+    # 2. Extract Keypoints (Iterate 18 COCO points)
     raw_18_coords = []
-    
     for joint_id in range(18):
-        # Slice the specific channel -> 2D array (H, W)
-        single_heatmap = full_heatmap[joint_id, :, :]
-        
-        # We need to create a dummy list for it to append to
-        # The function signature in your keypoints.py: 
-        # def extract_keypoints(heatmap, all_keypoints, total_keypoint_num):
+        single_heatmap = heatmaps[joint_id, :, :]
         found_keypoints_list = [] 
-        total_kpt_num = 0 # Dummy counter
+        extract_keypoints(single_heatmap, found_keypoints_list, 0)
         
-        # Call the function (It modifies found_keypoints_list in-place)
-        extract_keypoints(single_heatmap, found_keypoints_list, total_kpt_num)
-        
-        # --- FALLBACK LOGIC ---
-        # 1. Default to Center
+        # Fallback Logic
         x_orig, y_orig = img_w // 2, img_h // 2
-        
-        # 2. If we have history, prefer "Last Known Position" over Center
         if prev_kpts is not None:
-            # joint_id matches the index in prev_kpts
             x_orig, y_orig = prev_kpts[joint_id]
             
-        # 3. If OpenPose found a new valid point, update it
         if len(found_keypoints_list) > 0:
             candidates = found_keypoints_list[0]
             if len(candidates) > 0:
-                # Get best match (highest score is index 2)
                 best_match = max(candidates, key=lambda x: x[2])
-                
-                x_heatmap, y_heatmap = best_match[0], best_match[1]
-                
-                # Map back to original image
-                # Heatmap stride is 8 in standard OpenPose Lightweight
-                x_orig = int(x_heatmap * 8 / scale)
-                y_orig = int(y_heatmap * 8 / scale)
+                x_orig = int(best_match[0] * 8 / scale)
+                y_orig = int(best_match[1] * 8 / scale)
 
         raw_18_coords.append([x_orig, y_orig])
         
     kpts_np = np.array(raw_18_coords)
     
-    # 1. Filter & Reorder to VSViG Format (15 points, grouped)
-    # Head(0,14,15), RArm(2,3,4), RLeg(8,9,10), LArm(5,6,7), LLeg(11,12,13)
+    # 3. Filter & Reorder to VSViG Format (15 points)
+    # VSViG Order: Head(Nose,REye,LEye), RArm, RLeg, LArm, LLeg
+    # COCO Indices: 0, 14, 15... (Excluding 1, 16, 17)
     vsvig_indices = [0, 14, 15, 2, 3, 4, 8, 9, 10, 5, 6, 7, 11, 12, 13]
-    
     sorted_kpts_np = kpts_np[vsvig_indices]
     
-    # 2. Extract Patches using the SORTED 15 points
-    # (Assuming you modified extract_patches.py to NOT delete anything)
-    patches_np = extract_patches(frame, sorted_kpts_np, kernel_size=128, scale=0.25)
+    # 4. Extract Patches (Corrected Function)
+    patches_np = extract_patches_integrated(frame, sorted_kpts_np, kernel_size=128, scale=0.25)
     
-    # Safety Check
-    if np.isnan(patches_np).any():
-        patches_np = np.nan_to_num(patches_np, nan=0.0)
-    
-    # 3. Convert
+    # 5. Convert to Tensor (Normalize 0-1)
     patches_t = torch.from_numpy(patches_np).permute(0, 3, 1, 2).float() / 255.0
-    
-    # 4. Filter AND Reorder Keypoints (18 -> 15 Sorted by Partition)
-    # We map from OpenPose 18-index to VSViG 15-index
-    # OpenPose: 0:Nose, 1:Neck, 2:RSho, 3:RElb, 4:RWri, 5:LSho, 6:LElb, 7:LWri, 
-    #           8:RHip, 9:RKnee, 10:RAnk, 11:LHip, 12:LKnee, 13:LAnk, 14:REye, 15:LEye, 16:REar, 17:LEar
-    
-    # VSViG Order (Grouped by 3):
-    # Head:  [Nose(0), REye(14), LEye(15)]
-    # R-Arm: [RSho(2), RElb(3), RWri(4)]
-    # R-Leg: [RHip(8), RKnee(9), RAnk(10)]
-    # L-Arm: [LSho(5), LElb(6), LWri(7)]
-    # L-Leg: [LHip(11), LKnee(12), LAnk(13)]
-    
-    # 5. Convert to Tensor
     kpts_t = torch.from_numpy(sorted_kpts_np)
     
-    # Return patches, filtered kpts, AND raw kpts (for next frame state)
     return patches_t, kpts_t, kpts_np
 
 def parse_filename_info(folder_name, filename):
@@ -243,7 +255,13 @@ def parse_filename_info(folder_name, filename):
     # The folder is 'pat01', but Excel uses 'Pat01'
     pat_id = folder_name.capitalize() 
     
-    # 3. Extract Seizure ID using Regex
+    # 3. Specific Exclusions - this video has to be skipped
+    # Exclude "Sz4" specifically for "Pat05"
+    if pat_id == "Pat05" and "sz4" in clean_name:
+        print(f"   🚫 Skipping excluded file: {filename} for {pat_id}")
+        return None, None
+    
+    # 4. Extract Seizure ID using Regex
     # We look for "Sz" followed immediately by digits (e.g., Sz1, Sz10)
     # This matches "Sz1" inside "Sz1PG.mp4" or "Sz1P.mp4"
     match = re.search(r'(Sz\d+)', filename, re.IGNORECASE)
@@ -318,37 +336,52 @@ def main():
             if eeg_time == -1 or clin_time == -1:
                 print(f"   ❌ Error: Invalid timestamps in Excel for {pat_id} {sz_id}")
                 continue
+            # ==========================================
+            #  TIME TRUNCATION (VSViG Paper Rules)
+            # ==========================================
+            # Interictal: Max 30 mins before EEG onset [cite: 275]
+            # Ictal: Max 2 mins after clinical onset [cite: 567]
 
-            print(f"   ✅ Processing: {pat_id} {sz_id} | File: {vid_file} | EEG: {eeg_time}s | Clinical: {clin_time}s")
+            start_seconds = max(0, eeg_time - (MAX_INTERICTAL_MIN * 60))
+            end_seconds = clin_time + (MAX_ICTAL_MIN * 60)
+            
+            print(f"   ✅ {pat_id} {sz_id} | Window: {start_seconds}s to {end_seconds}s")
             
             # ==========================================
             #  VIDEO PROCESSING
             # ==========================================
             video_path = os.path.join(curr_pat_path, vid_file)
             cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                print(f"   ❌ Error: Could not open video {video_path}")
-                continue
+            if not cap.isOpened(): continue
 
             fps = cap.get(cv2.CAP_PROP_FPS)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            total_vid_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             
-            clip_len = int(5 * fps) # 5 seconds
+            # Convert time window to frames
+            start_frame = int(start_seconds * fps)
+            end_frame = int(end_seconds * fps)
+            if end_frame > total_vid_frames: end_frame = total_vid_frames
             
-            # Step sizes in frames
-            step_interictal = int(5 * fps) # No overlap
-            step_seizure = int(1 * fps)    # 4s overlap (5 - 1 = 4 overlap)
+            clip_len = int(5 * fps) # 5 seconds raw duration
             
-            current_frame = 0
+            # Step sizes (Overlap Strategy)
+            # Interictal: No overlap (Step = 5s) [cite: 573]
+            # Ictal/Transition: 4s overlap (Step = 1s) [cite: 573]
+            step_interictal = int(5 * fps)
+            step_seizure = int(1 * fps) 
             
-            # Using tqdm for progress bar
-            pbar = tqdm(total=total_frames - clip_len, desc=f"   Processing Clips")
+            current_frame = start_frame
+            pbar = tqdm(total=end_frame - start_frame, desc=f"   Processing")
             
-            while current_frame < (total_frames - clip_len):
+            # FIX: Initialize once per video file
+            last_known_kpts = None
+            
+            while current_frame < (end_frame - clip_len):
                 
                 # A. Determine Label First (to decide step size)
-                clip_end_time = (current_frame + clip_len) / fps
-                label = get_label(clip_end_time, eeg_time, clin_time)
+                clip_mid_time = (current_frame + clip_len/2) / fps
+                # Use end time for label definition usually, but for step size check mid or start is fine
+                label = get_label(clip_mid_time, eeg_time, clin_time)
                 
                 # B. Decide Step Size based on Label
                 if label == 0.0:
@@ -356,15 +389,43 @@ def main():
                 else:
                     current_step = step_seizure
                 
-                # C. Extract Frames (The "Stride" Logic)
+                # --- YOUR "FRAME -1" STRATEGY ---
+                # If we are overlapping (step < clip_len) OR if it's the very first frame,
+                # we need to ensure the state is causally correct.
+                
+                # Case 1: Overlapping (Seizure Mode)
+                # We jumped back in time. 'last_known_kpts' currently holds future data.
+                # We must fetch the true "past" (Frame -1).
+                if current_step < clip_len and current_frame > 0:
+                    # temporarily jump back 1 frame
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame - 1)
+                    ret_prev, frame_prev = cap.read()
+                    
+                    if ret_prev:
+                        # Run inference ONLY to get keypoints (ignore patches)
+                        # We pass prev_kpts=None here because frame-1 is our "best guess" reset point.
+                        # Ideally, OpenPose works well enough on a single frame to re-orient.
+                        _, _, raw_kpts_init = extract_features(frame_prev, pose_net, prev_kpts=None)
+                        last_known_kpts = raw_kpts_init
+                    else:
+                        # If reading frame-1 fails, fall back to None (Center)
+                        last_known_kpts = None
+                
+                # Case 2: First Frame of Video
+                elif current_frame == 0:
+                    last_known_kpts = None
+
+                # Case 3: Interictal (Continuous)
+                # We leave 'last_known_kpts' exactly as it is. 
+                # The end of Clip A (Frame 150) is the input for Clip B (Frame 151).
+
+                # C. # Extract Clip (Stride 5: 150 frames -> 30 frames)
                 clip_patches = []
                 clip_kpts = []
                 valid_clip = True
                 
-                # --- STATE VARIABLE FOR SMOOTHING ---
-                # Reset state at the start of every new clip to avoid drifting from jumps
-                last_known_kpts = None
-                
+                # We need exactly 30 frames extracted over the 5s window
+                # Range 0 to clip_len, stepping by STRIDE (5)
                 for i in range(0, clip_len, STRIDE):
                     cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame + i)
                     ret, frame = cap.read()
