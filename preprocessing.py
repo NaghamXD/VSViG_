@@ -9,13 +9,6 @@ from torchvision import transforms
 from tqdm import tqdm
 import re
 
-try:
-    from extract_patches import extract_patches
-except ImportError:
-    print("❌ Error: Could not find 'extract_patches.py'.")
-    print("Make sure the authors' script is saved as 'extract_patches.py' in this folder.")
-    exit()
-
 # --- 1. CONFIGURATION ---
 OUTPUT_FOLDER = 'processed_data' # Where to save the .pt files
 DATASET_ROOT = 'WU-SAHZU-EMU-Video/dataset' 
@@ -371,7 +364,7 @@ def main():
             step_seizure = int(1 * fps) 
             
             current_frame = start_frame
-            pbar = tqdm(total=end_frame - start_frame, desc=f"   Processing")
+            pbar = pbar = tqdm(total=end_frame - start_frame - clip_len, desc=f"   Processing")
             
             # FIX: Initialize once per video file
             last_known_kpts = None
@@ -449,7 +442,13 @@ def main():
                     
                     all_clip_data.append(final_clip_tensor)
                     all_clip_kpts.append(final_kpts_tensor)
-                    all_labels.append([clip_counter, label])
+                    # OLD LINE: 
+                    # all_labels.append([clip_counter, label])
+                    
+                    # NEW LINE (Add ID):
+                    # We store: [Index, Label, "PatID_SzID"]
+                    unique_id = f"{pat_id}_{sz_id}"
+                    all_labels.append([clip_counter, label, unique_id])
                     clip_counter += 1
                     
                     # E. Memory Chunk Save
