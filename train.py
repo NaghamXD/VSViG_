@@ -1,11 +1,10 @@
 from VSViG import *
 from torch.utils.data.dataset import Dataset
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import DataLoader
 import torch, json
 import torch.nn as nn
 import numpy as np
 import os
-import random
 from collections import defaultdict
 
 # --- CONFIGURATION ---
@@ -20,110 +19,63 @@ PATH_TO_BEST_MODEL = os.path.join(CHECKPOINT_DIR, "best_model.pth")
 PATH_TO_LAST_CKPT  = os.path.join(CHECKPOINT_DIR, "last_checkpoint.pth")
 PATH_TO_LOG_FILE   = os.path.join(CHECKPOINT_DIR, "training_log.json")
 
-# --- SMART SAMPLER (FIXES LOADING SPEED) ---
-class ChunkBatchSampler(Sampler):
-    """
-    Shuffles data, but keeps indices from the same chunk together 
-    to prevent constant hard drive reloading.
-    """
-    def __init__(self, dataset, batch_size):
-        self.batch_size = batch_size
-        self.chunk_indices = dataset.get_chunk_indices()
-        self.chunks = list(self.chunk_indices.keys())
-        
-    def __iter__(self):
-        # 1. Shuffle the order of chunks (e.g., read chunk_5, then chunk_2...)
-        random.shuffle(self.chunks)
-        
-        final_indices = []
-        
-        for chunk_name in self.chunks:
-            # 2. Get all indices in this chunk
-            indices = self.chunk_indices[chunk_name]
-            
-            # 3. Shuffle indices WITHIN the chunk
-            random.shuffle(indices)
-            
-            # 4. Add to list
-            final_indices.extend(indices)
-            
-        # 5. Yield batches
-        for i in range(0, len(final_indices), self.batch_size):
-            yield final_indices[i : i + self.batch_size]
-
-    def __len__(self):
-        return (sum(len(v) for v in self.chunk_indices.values()) + self.batch_size - 1) // self.batch_size
-
-# --- DATASET CLASS ---
+# --- DATASET CLASS (UPDATED) ---
 class vsvig_dataset(Dataset):
     def __init__(self, data_folder=None, label_file=None, transform=None):
         super().__init__()
         self._folder = data_folder
         self._transform = transform
         
+        # Define subfolders for patches and keypoints
+        self.patches_dir = os.path.join(data_folder, "patches")
+        self.kpts_dir = os.path.join(data_folder, "kpts")
+        
+        # Check if folders exist
+        if not os.path.exists(self.patches_dir) or not os.path.exists(self.kpts_dir):
+            raise FileNotFoundError(f"Ensure 'patches' and 'kpts' folders exist inside {data_folder}")
+
+        # Load Labels
         with open(label_file, 'rb') as f:
             self._labels = json.load(f)
-            
-        map_path = os.path.join(data_folder, 'chunk_map.json')
-        if not os.path.exists(map_path):
-            raise FileNotFoundError(f"Chunk map not found at {map_path}")
-            
-        with open(map_path, 'r') as f:
-            self._chunk_map = json.load(f) # {'global_id': [filename, local_idx]}
-            
-        self.last_chunk_name = None
-        self.last_chunk_data = None
-        self.last_chunk_kpts = None
-
-    def get_chunk_indices(self):
-        """Helper for the Sampler to know which ID belongs to which chunk"""
-        groups = defaultdict(list)
-        for idx, item in enumerate(self._labels):
-            global_id = str(item[0])
-            if global_id in self._chunk_map:
-                chunk_name = self._chunk_map[global_id][0]
-                groups[chunk_name].append(idx)
-        return groups
 
     def __getitem__(self, idx):
+        # Assuming label structure: [filename_string, label_value]
+        # Example: ["pat01_Sz1_1780", 1]
+        filename_base = str(self._labels[idx][0])
         target = float(self._labels[idx][1])
-        global_id = str(self._labels[idx][0]) 
         
-        if global_id not in self._chunk_map:
-             # Just return a zero-tensor if missing (safer than crashing mid-training)
-             # But strictly you should ensure map is complete.
-             raise IndexError(f"ID {global_id} missing from map.")
-
-        filename, local_idx = self._chunk_map[global_id]
+        # Construct paths
+        # NOTE: Assuming files end in .pt. If they represent .npy files, change to .npy and use np.load
+        patch_path = os.path.join(self.patches_dir, f"{filename_base}.pt")
+        kpts_path = os.path.join(self.kpts_dir, f"{filename_base}.pt")
         
-        # Lazy Loading
-        if filename != self.last_chunk_name:
-            self.last_chunk_name = filename
-            data_path = os.path.join(self._folder, filename)
-            kpts_path = os.path.join(self._folder, filename.replace('chunk_data', 'chunk_kpts'))
-            self.last_chunk_data = torch.load(data_path, map_location='cpu')
-            self.last_chunk_kpts = torch.load(kpts_path, map_location='cpu')
-            
-        data = self.last_chunk_data[local_idx] # (30, 15, 3, 32, 32)
-        kpts = self.last_chunk_kpts[local_idx] # (30, 15, 2)
+        # Load Data
+        try:
+            data = torch.load(patch_path, map_location='cpu') # Shape: (30, 15, 3, 32, 32)
+            kpts = torch.load(kpts_path, map_location='cpu')  # Shape: (30, 15, 2)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Could not find files for ID: {filename_base} at {patch_path}")
         
-        # --- FIX 1: NORMALIZE KEYPOINTS ---
+        # --- PREVIOUS FIX 1: NORMALIZE KEYPOINTS ---
+        # Ensure kpts are float
         kpts = kpts.float()
         kpts[:, :, 0] = kpts[:, :, 0] / 1920.0
         kpts[:, :, 1] = kpts[:, :, 1] / 1080.0
-
-        # --- FIX 2: ADD CONFIDENCE CHANNEL (2 -> 3 CHANNELS) ---
-        # Current shape: (30, 15, 2)
-        # We need: (30, 15, 3)
+        
+        '''        
+        # --- PREVIOUS FIX 2: ADD CONFIDENCE CHANNEL (2 -> 3 CHANNELS) ---
+        # Current shape: (30, 15, 2) -> We need: (30, 15, 3)
         confidence = torch.ones((30, 15, 1), dtype=kpts.dtype)
-        kpts = torch.cat((kpts, confidence), dim=2) 
+        kpts = torch.cat((kpts, confidence), dim=2)
         
         if self._transform: 
-            B_frames, P, C, H, W = data.shape 
-            data = data.view(B_frames*P*C, H, W)
-            data = self._transform(data)
-            data = data.view(B_frames, P, C, H, W)
-            
+            # Flatten dimensions for transform if needed, then reshape back
+            if len(data.shape) == 5:
+                B_frames, P, C, H, W = data.shape 
+                data = data.view(B_frames*P*C, H, W)
+                data = self._transform(data)
+                data = data.view(B_frames, P, C, H, W)
+         '''    
         sample = {
             'data': data,
             'kpts': kpts 
@@ -146,8 +98,9 @@ def train():
         dataset_train = vsvig_dataset(data_folder=PATH_TO_DATA_FOLDER, label_file=train_label_path)
         dataset_val = vsvig_dataset(data_folder=PATH_TO_DATA_FOLDER, label_file=val_label_path)
         
-        train_sampler = ChunkBatchSampler(dataset_train, batch_size=32)
-        train_loader = DataLoader(dataset_train, batch_sampler=train_sampler, num_workers=0)
+        # REMOVED ChunkBatchSampler
+        # Standard DataLoader with shuffle=True for training
+        train_loader = DataLoader(dataset_train, batch_size=32, shuffle=True, num_workers=0)
         val_loader = DataLoader(dataset_val, batch_size=32, shuffle=False, num_workers=0)
         
         # 2. Setup Model & Hardware
@@ -169,12 +122,11 @@ def train():
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.1)
 
-        # --- RESUME LOGIC STARTS HERE ---
+        # --- RESUME LOGIC ---
         start_epoch = 0
         min_valid_loss = np.inf
         history = {'train_loss': [], 'val_loss': [], 'val_rmse': []}
 
-        # Check for 'last_checkpoint.pth' (Full state for resuming)
         if os.path.exists(PATH_TO_LAST_CKPT):
             print(f"Found checkpoint: {PATH_TO_LAST_CKPT}. Resuming...")
             checkpoint = torch.load(PATH_TO_LAST_CKPT, map_location=device)
@@ -185,21 +137,15 @@ def train():
             start_epoch = checkpoint['epoch'] + 1
             min_valid_loss = checkpoint['min_valid_loss']
             
-            # Load history if it exists
             if 'history' in checkpoint:
                 history = checkpoint['history']
 
-        # Fallback: If only 'best_model.pth' exists (like your current situation)
         elif os.path.exists(PATH_TO_BEST_MODEL):
             print(f"Found best_model.pth but no checkpoint. Loading weights only.")
-            # We assume a weight-only save for the old file
             try:
                 model.load_state_dict(torch.load(PATH_TO_BEST_MODEL, map_location=device))
             except:
                 print("Could not load best_model.pth weights. Starting fresh.")
-            # Since we don't know the epoch, we might have to start at 0 or guess
-            # You mentioned you were at epoch 137, so let's set it manually if you like:
-            # start_epoch = 137 
 
         epochs = 200
         
@@ -262,7 +208,6 @@ def train():
                 
                 print(f' +++ Val Loss: {avg_val_loss:.3f} | Val RMSE: {avg_rmse:.3f} +++')
 
-                # Save BEST model (Weights only is fine for inference)
                 if min_valid_loss > valid_loss:
                     print(f'   -> Saving new best model to {PATH_TO_BEST_MODEL}')
                     min_valid_loss = valid_loss
@@ -270,8 +215,7 @@ def train():
             
             scheduler.step()
 
-            # 5. SAVE REGULAR CHECKPOINT (Every Epoch)
-            # This allows you to resume even if you crash between validation runs
+            # 5. Save Checkpoint
             torch.save({
                 'epoch': e,
                 'model_state_dict': model.state_dict(),
@@ -281,7 +225,7 @@ def train():
                 'history': history
             }, PATH_TO_LAST_CKPT)
 
-            # 6. SAVE LOGS TO FILE
+            # 6. Save Logs
             with open(PATH_TO_LOG_FILE, 'w') as f:
                 json.dump(history, f, indent=4)
                     

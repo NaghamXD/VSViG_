@@ -249,7 +249,7 @@ class STViG(nn.Module):
         else:
             ch4stem = output_channels[0]
         self.stem = Stem(input_dim=3, output_dim=ch4stem) # B T P C
-        self.stem_pe = Stem_pe(input_dim=3, output_dim=ch4stem)
+        self.stem_pe = Stem_pe(input_dim=2, output_dim=ch4stem)
         
         self.in_channels = output_channels[0]
         # Original: self.backbone = []

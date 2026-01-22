@@ -5,6 +5,8 @@ from collections import defaultdict
 
 # CONFIGURATION
 OUTPUT_FOLDER = 'processed_data'
+PATCHES_DIR = os.path.join(OUTPUT_FOLDER, 'patches')
+KPTS_DIR = os.path.join(OUTPUT_FOLDER, 'kpts')
 LABEL_FILE = os.path.join(OUTPUT_FOLDER, 'labels.json')
 
 def print_duration_stats(name, count):
@@ -17,23 +19,36 @@ def main():
     if not os.path.exists(LABEL_FILE):
         print(f"❌ Error: {LABEL_FILE} not found. Run preprocessing first.")
         return
-
+    if not os.path.exists(PATCHES_DIR) or not os.path.exists(KPTS_DIR):
+        print(f"⚠️ Warning: 'patches' or 'kpts' folders not found inside {OUTPUT_FOLDER}.")
+        print("   Ensure your preprocessing script is creating these folders.")
+        # We don't return here because the split logic only strictly needs the JSON file.
+    
+    # 2. Load the master label list    
     with open(LABEL_FILE, 'r') as f:
         all_labels = json.load(f)
         
-    # Check if ID exists in labels
-    if len(all_labels[0]) < 3:
-        print("❌ Error: labels.json missing Seizure IDs.")
-        print("   Update preprocessing.py to save: [clip_idx, label, unique_id]")
-        return
-    
     # 1. Group Data by Class and Seizure ID
     # Structure: seizure_map["Pat01_Sz1"] = {'transition': [], 'ictal': []}
     seizure_map = defaultdict(lambda: {'transition': [], 'ictal': []})
     interictal_pool = []
 
-    for item in all_labels:
-        clip_idx, label, sz_id = item
+    # Iterate through the dictionary items
+    for filename, label in all_labels.items():
+        # Parse filename like "Pat1_Sz1_005.pt" -> sz_id = "Pat1_Sz1"
+        # We assume the last underscore separates the frame index.
+        try:
+            # Remove extension
+            name_no_ext = os.path.splitext(filename)[0]
+            # Split by underscores. The ID is everything up to the last underscore.
+            parts = name_no_ext.split('_')
+            sz_id = "_".join(parts[:-1]) 
+        except:
+            print(f"⚠️ Skipping malformed filename: {filename}")
+            continue
+
+        # Create the item tuple expected by the logic: (filename, label, sz_id)
+        item = (filename, label, sz_id)
         
         if label == 0.0:
             interictal_pool.append(item)
@@ -42,6 +57,12 @@ def main():
         elif label >= 1.0:
             seizure_map[sz_id]['ictal'].append(item)
    
+    print(f"✅ Loaded {len(all_labels)} clips.")
+    print(f"   - Interictal pool: {len(interictal_pool)}")
+    print(f"   - Seizure events found: {len(seizure_map)}")
+
+    # 4. Perform the Split (VSViG Logic: Leave-One-Out validation)
+    # We select one seizure ID to be the validation set (unhealthy part).
     # 2. Split "From Each Seizure" (Paper Rule)
     # "randomly extract 20% clips from both transition and ictal periods from each seizure"
     
@@ -113,6 +134,10 @@ def main():
     print_duration_stats("Interictal (Train Pool)", len(train_healthy))
     print_duration_stats("Transition (Train Pool)", len([x for x in train_unhealthy if 0<x[1]<1]))
     print_duration_stats("Ictal (Train Pool)", len([x for x in train_unhealthy if x[1]>=1]))
+    print("-" * 30)
+    print_duration_stats("Interictal (Validation Pool)", len(val_healthy))
+    print_duration_stats("Transition (Validation Pool)", len([x for x in val_unhealthy if 0<x[1]<1]))
+    print_duration_stats("Ictal (Validation Pool)", len([x for x in val_unhealthy if x[1]>=1]))
     print("-" * 30)
     print(f"✅ Training Set:   {len(train_set)} clips")
     print(f"✅ Validation Set: {len(val_set)} clips")
